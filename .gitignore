@@ -29,9 +29,7 @@ venv/
 *.swp
 
 # Data and exports
-data/samples/*.mp3
-data/samples/*.wav
-data/samples/*.txt
+data/samples/
 *.csv
 *.ics
 
@@ -46,3 +44,5 @@ Thumbs.db
 
 # Byte-compiled/misc
 *.so
+
+

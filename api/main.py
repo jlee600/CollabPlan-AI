@@ -6,6 +6,8 @@ from datetime import date
 from sqlmodel import Session, select
 from store.db import init_db, Run, Segment, engine
 
+from core.asr import get_asr, ASRSegment
+
 import uuid
 
 app = FastAPI(
@@ -84,22 +86,35 @@ def analyze(req: AnalyzeRequest):
 
 @app.post("/transcribe", response_model=TranscribeResponse)
 def transcribe_audio(req: TranscribeRequest):
-    run_id = f"run_{uuid.uuid4().hex[:12]}"
-    duration = 12.34  # placeholder seconds
+    """
+    Real transcription using faster-whisper.
+    - Reads the file at req.path
+    - Saves segments to DB
+    - Returns run_id, duration, segments
+    """
+    # Run ASR
+    asr = get_asr()
+    duration, segs_asr = asr.transcribe_file(req.path)
 
-    segs = [
-        SegmentOut(idx=0, start=0.0, end=5.5, text="This is a placeholder transcript.", speaker="S1"),
-        SegmentOut(idx=1, start=5.5, end=12.3, text="We will replace this with ASR output.", speaker="S2"),
+    # Map ASR segments to API model
+    segs_out = [
+        SegmentOut(idx=s.idx, start=s.start, end=s.end, text=s.text, speaker=s.speaker)
+        for s in segs_asr
     ]
 
-    # Save to DB
+    # Persist
+    run_id = f"run_{uuid.uuid4().hex[:12]}"
     with Session(engine) as session:
         session.add(Run(id=run_id, meeting_date=req.meeting_date, source=req.source, duration_sec=duration))
-        for s in segs:
+        for s in segs_out:
             session.add(Segment(
-                run_id=run_id, idx=s.idx, start=s.start, end=s.end,
-                text=s.text, speaker=s.speaker
+                run_id=run_id,
+                idx=s.idx,
+                start=s.start,
+                end=s.end,
+                text=s.text,
+                speaker=s.speaker
             ))
         session.commit()
 
-    return TranscribeResponse(run_id=run_id, duration_sec=duration, segments=segs)
+    return TranscribeResponse(run_id=run_id, duration_sec=duration, segments=segs_out)
