@@ -1,0 +1,48 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environment
+collab-ai/
+env/
+venv/
+
+# Local configuration
+*.env
+*.ini
+*.toml
+*.yaml
+*.yml
+
+# IDE settings
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Logs and temp files
+*.log
+*.tmp
+*.temp
+*.swp
+
+# Data and exports
+data/samples/*.mp3
+data/samples/*.wav
+data/samples/*.txt
+*.csv
+*.ics
+
+# Model weights (large files)
+*.bin
+*.pt
+*.onnx
+
+# OS-specific
+.DS_Store
+Thumbs.db
+
+# Byte-compiled/misc
+*.so
