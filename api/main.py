@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from typing import List, Optional
 from datetime import date
@@ -7,6 +7,7 @@ from sqlmodel import Session, select
 from store.db import init_db, Run, Segment, engine
 
 from core.asr import get_asr, ASRSegment
+from core.extract import extract_plan, LLMError
 
 import uuid
 
@@ -63,6 +64,15 @@ class TranscribeResponse(BaseModel):
     duration_sec: float
     segments: List[SegmentOut]
 
+# ---------- analyze/runID ----------
+
+class AnalyzePlanResponse(BaseModel):
+    run_id: str
+    meeting_date: date
+    summary: str
+    tasks: List[Task]
+    open_questions: List[str]
+
 # ---------- Routes ----------
 
 @app.get("/health")
@@ -118,3 +128,40 @@ def transcribe_audio(req: TranscribeRequest):
         session.commit()
 
     return TranscribeResponse(run_id=run_id, duration_sec=duration, segments=segs_out)
+
+@app.post("/analyze/{run_id}", response_model=AnalyzePlanResponse)
+def analyze_run(run_id: str):
+    with Session(engine) as session:
+        run = session.exec(select(Run).where(Run.id == run_id)).first()
+        if not run:
+            raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
+        segs = session.exec(select(Segment).where(Segment.run_id == run_id).order_by(Segment.idx)).all()
+        seg_dicts = [{"idx": s.idx, "start": s.start, "end": s.end, "text": s.text, "speaker": s.speaker} for s in segs]
+
+    try:
+        plan = extract_plan(run.meeting_date, seg_dicts)
+    except LLMError as e:
+        raise HTTPException(status_code=502, detail=f"LLM failure: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Analyze failed: {e}")
+
+    tasks = [
+        Task(
+            title=t["title"],
+            owner=t.get("owner"),
+            due_date=t.get("due_date"),
+            priority=t.get("priority"),
+            dependencies=t.get("dependencies", []),
+            evidence=Evidence(segment_idx=None, span=None),
+            confidence=t.get("confidence"),
+        )
+        for t in plan["tasks"]
+    ]
+
+    return AnalyzePlanResponse(
+        run_id=run_id,
+        meeting_date=run.meeting_date,
+        summary=plan["summary"],
+        tasks=tasks,
+        open_questions=plan["open_questions"],
+    )
