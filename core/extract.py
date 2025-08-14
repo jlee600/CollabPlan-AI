@@ -1,16 +1,20 @@
 from __future__ import annotations
-
+import re
 import os
 import json
 import textwrap
 from typing import Any, Dict, List, Optional, Tuple
-from datetime import date
-
+from datetime import date, datetime, timedelta, time
 import requests
 import dateparser
+try:
+    import spacy
+    _NLP = spacy.load("en_core_web_sm")
+except Exception:
+    _NLP = None
 
-
-# Point to your running Ollama server
+_PERSON_RE = re.compile(r"\b([A-Z][a-z]{2,})\b")
+# Point to running Ollama server
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434/api/generate")
 DEFAULT_MODEL = os.getenv("ANALYZER_MODEL", "mistral:7b")
 
@@ -54,33 +58,37 @@ def _ollama_generate(prompt: str, model: str = DEFAULT_MODEL, temperature: float
     return text
 
 
-def _build_prompt(meeting_date: date, chunk_text: str) -> str:
-    schema = textwrap.dedent("""
+def _build_prompt(meeting_date: date, chunk_text: str, speakers: List[str]) -> str:
+    speaker_list = ", ".join(speakers) if speakers else "unknown"
+
+    schema = """
     Return ONLY valid JSON with this schema, no markdown and no extra text:
     {
-      "summary": "string",
+      "summary": "string",        // write 5-7 sentences: context, named speakers and roles, concrete points, status, next steps
       "tasks": [
         {
           "title": "string",
-          "owner": "string|null",
-          "due_date_ref": "string|null",
+          "owner": "string|null",          // choose from the known speakers if possible: EXACT NAME
+          "due_date_ref": "string|null",   // e.g., "next Friday", "EOM", "beta soon"
           "dependencies": ["string"],
           "priority_hint": "High|Medium|Low|null",
-          "evidence_text": "string"
+          "evidence_text": "string"        // short quote from transcript supporting this task
         }
       ],
       "open_questions": ["string"]
     }
-    """).strip()
+    """.strip()
 
-    rules = textwrap.dedent(f"""
-    You extract clear, actionable tasks with verbs.
+    rules = f"""
     Meeting date: {meeting_date.isoformat()}.
-    If owner is unclear, set owner to null.
+    Known speakers in this transcript: {speaker_list}.
+    When setting "owner", prefer an exact match from the known speakers.
+    Only create tasks that are clearly implied by the text.
+    Always fill "evidence_text" with a short quote backing the task.
+    Keep "priority_hint" realistic. Use High only if urgency words are present (urgent, asap, by EOD/EOW, blocker).
     If a due date is spoken, put it in due_date_ref exactly as heard.
-    If there are no tasks, return "tasks": [].
     Output must be JSON only.
-    """).strip()
+    """.strip()
 
     return f"{rules}\n\n{schema}\n\nTranscript:\n\"\"\"\n{chunk_text}\n\"\"\""
 
@@ -96,16 +104,6 @@ def _parse_json_or_empty(s: str) -> Dict[str, Any]:
             except Exception:
                 pass
         return {"summary": "", "tasks": [], "open_questions": []}
-
-
-def _resolve_due_date(meeting_date: date, due_ref: Optional[str]) -> Tuple[Optional[str], float]:
-    if not due_ref:
-        return None, 0.0
-    dt = dateparser.parse(due_ref, settings={"RELATIVE_BASE": meeting_date})
-    if not dt:
-        return None, 0.3
-    return dt.date().isoformat(), 0.9
-
 
 def chunk_segments_to_text(segments: List[Dict[str, Any]], max_chars: int = 3000) -> List[str]:
     chunks, cur, cur_len = [], [], 0
@@ -125,13 +123,14 @@ def chunk_segments_to_text(segments: List[Dict[str, Any]], max_chars: int = 3000
 
 def extract_plan(meeting_date: date, segments: List[Dict[str, Any]], model: str = DEFAULT_MODEL) -> Dict[str, Any]:
     texts = chunk_segments_to_text(segments)
+    speakers = sorted({(s.get("speaker") or "").strip() for s in segments if s.get("speaker")})
 
     merged_summary: List[str] = []
     merged_tasks: List[Dict[str, Any]] = []
     merged_open: List[str] = []
 
     for tx in texts:
-        prompt = _build_prompt(meeting_date, tx)
+        prompt = _build_prompt(meeting_date, tx, speakers)
         raw = _ollama_generate(prompt, model=model, temperature=0.1, request_json=True)
         obj = _parse_json_or_empty(raw)
 
@@ -162,6 +161,19 @@ def extract_plan(meeting_date: date, segments: List[Dict[str, Any]], model: str 
         for q in obj.get("open_questions", []):
             if isinstance(q, str) and q.strip():
                 merged_open.append(q.strip())
+    
+    # Collect names from whole transcript and fill missing owners if the evidence mentions them
+    full_text = " ".join([s.get("text", "") for s in segments])
+    name_candidates = _extract_person_names(full_text)
+
+    for t in merged_tasks:
+        if t.get("owner"):
+            continue
+        ev = t.get("evidence_text", "") or t.get("title", "")
+        nm = _nearest_name_in_text(ev, name_candidates)
+        if nm:
+            t["owner"] = nm
+            t["confidence"] = max(t.get("confidence", 0.0), 0.6)
 
     # Merge summary and dedupe tasks by lowercase title
     final_summary = " ".join(merged_summary)[:600] if merged_summary else ""
@@ -193,3 +205,92 @@ def extract_plan(meeting_date: date, segments: List[Dict[str, Any]], model: str 
         "tasks": deduped_tasks,
         "open_questions": merged_open[:10]
     }
+
+def _extract_person_names(text: str) -> List[str]:
+    """
+    Return a small unique list of person-like names.
+    Uses spaCy PERSON entities if available, else simple regex on capitalized words.
+    """
+    names: List[str] = []
+    if _NLP:
+        doc = _NLP(text)
+        for ent in doc.ents:
+            if ent.label_ == "PERSON":
+                n = ent.text.strip()
+                if 2 <= len(n) <= 40 and n not in names:
+                    names.append(n)
+    else:
+        # very simple fallback
+        for m in _PERSON_RE.finditer(text):
+            n = m.group(1)
+            if n not in names:
+                names.append(n)
+    # keep it short
+    return names[:10]
+
+
+def _nearest_name_in_text(evidence: str, names: List[str]) -> Optional[str]:
+    """Pick a name that appears inside the evidence_text, if any."""
+    ev = evidence or ""
+    for n in names:
+        # simple contains, case sensitive first, then case fold
+        if n in ev or n.lower() in ev.lower():
+            return n
+    return None
+
+
+def _last_day_of_month(d: date) -> date:
+    if d.month == 12:
+        return date(d.year, 12, 31)
+    first_next = date(d.year, d.month + 1, 1)
+    return first_next - timedelta(days=1)
+
+
+def _end_of_week(d: date) -> date:
+    # treat Friday as end of week
+    # weekday(): Mon=0..Sun=6
+    delta = (4 - d.weekday()) % 7
+    return d + timedelta(days=delta)
+
+
+def _resolve_due_date(meeting_date: date, due_ref: Optional[str]) -> Tuple[Optional[str], float]:
+    """
+    Extend previous resolver:
+    - EOD / COB: same day
+    - EOW: that week's Friday
+    - EOM: last day of month
+    Otherwise, let dateparser try.
+    """
+    if not due_ref:
+        return None, 0.0
+
+    s = due_ref.strip().lower()
+
+    # Short forms
+    if s in {"eod", "cob", "end of day", "close of business"}:
+        return meeting_date.isoformat(), 0.8
+    if s in {"eow", "end of week"}:
+        return _end_of_week(meeting_date).isoformat(), 0.8
+    if s in {"eom", "end of month"}:
+        return _last_day_of_month(meeting_date).isoformat(), 0.8
+
+    # Phrases like "by EOD/EOW/EOM"
+    if "by eod" in s or "by cob" in s or "by close of business" in s:
+        return meeting_date.isoformat(), 0.8
+    if "by eow" in s or "by end of week" in s:
+        return _end_of_week(meeting_date).isoformat(), 0.8
+    if "by eom" in s or "by end of month" in s:
+        return _last_day_of_month(meeting_date).isoformat(), 0.8
+
+    # dateparser needs a datetime, not a date
+    rel_base = datetime.combine(meeting_date, time(9, 0))
+    dt = dateparser.parse(
+        due_ref,
+        settings={
+            "RELATIVE_BASE": rel_base,
+            "PREFER_DATES_FROM": "future",
+        },
+    )
+    if not dt:
+        return None, 0.3
+    return dt.date().isoformat(), 0.9
