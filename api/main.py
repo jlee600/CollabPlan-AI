@@ -4,12 +4,13 @@ from typing import List, Optional
 from datetime import date
 
 from sqlmodel import Session, select
-from store.db import init_db, Run, Segment, engine
+from store.db import init_db, Run, Segment, Plan, TaskRow, engine
 
 from core.asr import get_asr, ASRSegment
 from core.extract import extract_plan, LLMError
 
 import uuid
+import json
 
 app = FastAPI(
     title="CollabPlan-AI Core",
@@ -73,7 +74,18 @@ class AnalyzePlanResponse(BaseModel):
     tasks: List[Task]
     open_questions: List[str]
 
+class RunBundle(BaseModel):
+    run_id: str
+    meeting_date: date
+    duration_sec: Optional[float] = None
+    segments: List[SegmentOut]
+    summary: str
+    tasks: List[Task]
+    open_questions: List[str]
+
+##############################
 # ---------- Routes ----------
+##############################
 
 @app.get("/health")
 def health():
@@ -158,10 +170,77 @@ def analyze_run(run_id: str):
         for t in plan["tasks"]
     ]
 
+    # Persist plan and tasks
+    with Session(engine) as session:
+        # Remove old plan/tasks for idempotency if you re-run analyze
+        session.exec(select(Plan).where(Plan.run_id == run_id))
+        session.exec(select(TaskRow).where(TaskRow.run_id == run_id))
+        session.query(Plan).filter(Plan.run_id == run_id).delete()
+        session.query(TaskRow).filter(TaskRow.run_id == run_id).delete()
+
+        session.add(Plan(
+            run_id=run_id,
+            summary=plan["summary"],
+            open_questions_json=json.dumps(plan["open_questions"])
+        ))
+        for t in plan["tasks"]:
+            session.add(TaskRow(
+                run_id=run_id,
+                title=t["title"],
+                owner=t.get("owner"),
+                due_date=t.get("due_date"),
+                priority=t.get("priority"),
+                dependencies_json=json.dumps(t.get("dependencies", [])),
+                evidence_idx=None,
+                evidence_span_json=None,
+                confidence=t.get("confidence"),
+            ))
+        session.commit()
+
     return AnalyzePlanResponse(
         run_id=run_id,
         meeting_date=run.meeting_date,
         summary=plan["summary"],
         tasks=tasks,
         open_questions=plan["open_questions"],
+    )
+
+@app.get("/run/{run_id}", response_model=RunBundle)
+def get_run(run_id: str):
+    with Session(engine) as session:
+        run = session.exec(select(Run).where(Run.id == run_id)).first()
+        if not run:
+            raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
+
+        segs = session.exec(
+            select(Segment).where(Segment.run_id == run_id).order_by(Segment.idx)
+        ).all()
+        segs_out = [SegmentOut(idx=s.idx, start=s.start, end=s.end, text=s.text, speaker=s.speaker) for s in segs]
+
+        plan = session.exec(select(Plan).where(Plan.run_id == run_id)).first()
+        task_rows = session.exec(select(TaskRow).where(TaskRow.run_id == run_id)).all()
+
+        summary = plan.summary if plan else ""
+        open_q = json.loads(plan.open_questions_json) if plan else []
+
+        tasks = []
+        for tr in task_rows:
+            tasks.append(Task(
+                title=tr.title,
+                owner=tr.owner,
+                due_date=tr.due_date,
+                priority=tr.priority,
+                dependencies=json.loads(tr.dependencies_json or "[]"),
+                evidence=Evidence(segment_idx=tr.evidence_idx, span=json.loads(tr.evidence_span_json) if tr.evidence_span_json else None),
+                confidence=tr.confidence
+            ))
+
+    return RunBundle(
+        run_id=run_id,
+        meeting_date=run.meeting_date,
+        duration_sec=run.duration_sec,
+        segments=segs_out,
+        summary=summary,
+        tasks=tasks,
+        open_questions=open_q
     )
