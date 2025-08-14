@@ -238,6 +238,7 @@ def _nearest_name_in_text(evidence: str, names: List[str]) -> Optional[str]:
             return n
     return None
 
+# ---------- due date ----------
 
 def _last_day_of_month(d: date) -> date:
     if d.month == 12:
@@ -252,6 +253,27 @@ def _end_of_week(d: date) -> date:
     delta = (4 - d.weekday()) % 7
     return d + timedelta(days=delta)
 
+def _next_weekday(d: date, target_idx: int) -> date:
+    """Next occurrence of weekday >= tomorrow (never today)."""
+    days_ahead = (target_idx - d.weekday()) % 7
+    if days_ahead == 0:
+        days_ahead = 7
+    return d + timedelta(days=days_ahead)
+
+def _this_or_next_weekday(d: date, target_idx: int) -> date:
+    """
+    'this Friday' => upcoming Friday in the current week (could be today).
+    If the day has passed this week, use the one in the coming week.
+    """
+    days_ahead = (target_idx - d.weekday()) % 7
+    return d + timedelta(days=days_ahead)
+
+def _strip_leading_by(s: str) -> str:
+    return re.sub(r"^\s*(by|on|at)\s+", "", s, flags=re.IGNORECASE)
+
+def _rel_base_dt(meeting_date: date) -> datetime:
+    # dateparser requires a datetime for RELATIVE_BASE
+    return datetime.combine(meeting_date, datetime.min.time())
 
 def _resolve_due_date(meeting_date: date, due_ref: Optional[str]) -> Tuple[Optional[str], float]:
     """
@@ -263,7 +285,9 @@ def _resolve_due_date(meeting_date: date, due_ref: Optional[str]) -> Tuple[Optio
     """
     if not due_ref:
         return None, 0.0
-
+    s_raw = due_ref.strip()
+    if not s_raw:
+        return None, 0.0
     s = due_ref.strip().lower()
 
     # Short forms
@@ -281,16 +305,44 @@ def _resolve_due_date(meeting_date: date, due_ref: Optional[str]) -> Tuple[Optio
         return _end_of_week(meeting_date).isoformat(), 0.8
     if "by eom" in s or "by end of month" in s:
         return _last_day_of_month(meeting_date).isoformat(), 0.8
+    
+    wd_map = {
+        "monday": 0, "mon": 0,
+        "tuesday": 1, "tue": 1, "tues": 1,
+        "wednesday": 2, "wed": 2,
+        "thursday": 3, "thu": 3, "thur": 3, "thurs": 3,
+        "friday": 4, "fri": 4,
+        "saturday": 5, "sat": 5,
+        "sunday": 6, "sun": 6,
+    }
+    
+    import re as _re
+    m = _re.search(r"\b(this|next)?\s*(monday|mon|tuesday|tue|tues|wednesday|wed|thursday|thu|thur|thurs|friday|fri|saturday|sat|sunday|sun)\b", s)
+    if m:
+        which = (m.group(1) or "").strip()
+        target_idx = wd_map[m.group(2)]
+        if which == "next":
+            # strictly the following week
+            dt = _next_weekday(meeting_date, target_idx)
+        else:
+            # "this <weekday>" or bare weekday => this week (today allowed)
+            dt = _this_or_next_weekday(meeting_date, target_idx)
+        return dt.isoformat(), 0.88
 
-    # dateparser needs a datetime, not a date
-    rel_base = datetime.combine(meeting_date, time(9, 0))
-    dt = dateparser.parse(
-        due_ref,
-        settings={
-            "RELATIVE_BASE": rel_base,
-            "PREFER_DATES_FROM": "future",
-        },
-    )
-    if not dt:
-        return None, 0.3
-    return dt.date().isoformat(), 0.9
+    # "in N days/weeks"
+    m = _re.search(r"\b(?:in|within)\s+(\d+)\s+(day|days|week|weeks)\b", s)
+    if m:
+        n = int(m.group(1))
+        unit = m.group(2)
+        dt = meeting_date + (timedelta(weeks=n) if "week" in unit else timedelta(days=n))
+        return dt.isoformat(), 0.88
+
+    # fallback to dateparser (datetime)
+    try:
+        dt = dateparser.parse(s_raw, settings={"RELATIVE_BASE": _rel_base_dt(meeting_date)})
+        if dt:
+            return dt.date().isoformat(), 0.9
+    except Exception:
+        pass
+
+    return None, 0.3
