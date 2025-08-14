@@ -22,7 +22,7 @@ class LLMError(RuntimeError):
     pass
 
 
-def _ollama_generate(prompt: str, model: str = DEFAULT_MODEL, temperature: float = 0.1, request_json: bool = True) -> str:
+def _ollama_generate(prompt: str, model: str = DEFAULT_MODEL, temperature: float = 0.2, request_json: bool = True) -> str:
     """
     One-shot call to Ollama. If request_json=True, we add format:'json'.
     If that yields an empty response, retry once without the format hint.
@@ -82,33 +82,56 @@ def _build_prompt(meeting_date: date, chunk_text: str, speakers: List[str]) -> s
     rules = f"""
     Meeting date: {meeting_date.isoformat()}.
     Known speakers in this transcript: {speaker_list}.
-    When setting "owner", prefer an exact match from the known speakers.
-    Only create tasks that are clearly implied by the text.
-    Always fill "evidence_text" with a short quote backing the task.
-    Keep "priority_hint" realistic. Use High only if urgency words are present (urgent, asap, by EOD/EOW, blocker).
-    If a due date is spoken, put it in due_date_ref exactly as heard.
-    If information (owner, due date, dependencies) isn’t clearly stated, leave it null/empty.
-    Do not invent details or entities not in the transcript.
-    Include who decided what, any dates mentioned, and 2–4 concrete next steps in the summary.
-    Output must be JSON only.
+
+    Rules:
+    - JSON only. No prose outside JSON.
+    - Return 3–6 tasks if content allows.
+    - Make tasks concrete with an action verb + deliverable (doc, PR, ticket, demo). No vague "gather feedback" unless explicitly requested.
+    - Prefer ONE exact owner from known speakers; if unsure, set owner to null.
+    - Do not invent dates. Put relative phrases in due_date_ref.
+    - Dependencies must reference other task titles exactly (or leave empty).
+    - evidence_text must quote the line that implies the action.
+    - Merge duplicates. Summary: 2–3 complete sentences.
     """.strip()
+
 
     return f"{rules}\n\n{schema}\n\nTranscript:\n\"\"\"\n{chunk_text}\n\"\"\""
 
+def _looks_truncated(s: str) -> bool:
+    s = (s or "").strip()
+    return bool(s) and s[-1] not in ".!?"
+
+def _keep_questions_only(items: List[str]) -> List[str]:
+    out = []
+    for q in items or []:
+        q = (q or "").strip()
+        if not q:
+            continue
+        first = q.split(" ", 1)[0].lower()
+        if q.endswith("?") or first in {"who","what","when","where","why","how","which"}:
+            out.append(q)
+    return out
 
 def _parse_json_or_empty(s: str) -> Dict[str, Any]:
+    def _load(txt: str) -> Dict[str, Any]:
+        obj = json.loads(txt)
+        # normalize a bit
+        obj["summary"] = (obj.get("summary") or "").strip()
+        obj["open_questions"] = _keep_questions_only(obj.get("open_questions") or [])
+        return obj
+
     try:
-        return json.loads(s)
+        return _load(s)
     except Exception:
         start, end = s.find("{"), s.rfind("}")
         if start != -1 and end != -1 and end > start:
             try:
-                return json.loads(s[start:end+1])
+                return _load(s[start:end+1])
             except Exception:
                 pass
         return {"summary": "", "tasks": [], "open_questions": []}
 
-def chunk_segments_to_text(segments: List[Dict[str, Any]], max_chars: int = 3000) -> List[str]:
+def chunk_segments_to_text(segments: List[Dict[str, Any]], max_chars: int = 1200) -> List[str]:
     chunks, cur, cur_len = [], [], 0
     for seg in segments:
         t = seg.get("text") or ""
@@ -132,17 +155,16 @@ def _is_task_plausible(t: dict, transcript_text: str) -> bool:
     title = (t.get("title") or "").strip()
     if len(title) < 4:
         return False
-    
-    # reject titles that are only a single filler verb/noun
-    simple = re.sub(r"[^a-zA-Z ]+", "", title).lower().strip()
-    if simple in _FILLER_TITLES:
-        return False
-    
-    # require that at least one content word from the title appears in transcript
-    words = [w for w in re.findall(r"[a-zA-Z]{3,}", simple) if w not in _FILLER_TITLES]
-    if words:
-        hits = sum(1 for w in words if w.lower() in transcript_text.lower())
-        if hits == 0:
+
+    # allow if there is any action verb anywhere, else fallback to len+overlap
+    verbs = r"\b(ship|create|draft|write|review|prepare|implement|integrate|deploy|fix|document|outline|summarize|plan|schedule|gather|research)\b"
+    if not re.search(verbs, title.lower()):
+        # still allow if content words overlap transcript
+        simple = re.sub(r"[^a-zA-Z ]+", "", title).lower().strip()
+        if simple in _FILLER_TITLES:
+            return False
+        words = [w for w in re.findall(r"[a-zA-Z]{3,}", simple) if w not in _FILLER_TITLES]
+        if words and sum(1 for w in words if w in transcript_text.lower()) == 0:
             return False
     return True
 
@@ -156,8 +178,13 @@ def extract_plan(meeting_date: date, segments: List[Dict[str, Any]], model: str 
 
     for tx in texts:
         prompt = _build_prompt(meeting_date, tx, speakers)
-        raw = _ollama_generate(prompt, model=model, temperature=0.1, request_json=True)
+        raw = _ollama_generate(prompt, model=model, temperature=0.2, request_json=True)
         obj = _parse_json_or_empty(raw)
+        if (_looks_truncated(obj.get("summary")) or (not obj.get("summary") and not obj.get("tasks"))):
+            # one retry with an explicit instruction
+            retry_prompt = prompt + "\n\nReturn valid JSON only. No notes."
+            raw = _ollama_generate(retry_prompt, model=model, temperature=0.2, request_json=True)
+            obj = _parse_json_or_empty(raw)
 
         if obj.get("summary"):
             merged_summary.append(obj["summary"])
@@ -167,11 +194,26 @@ def extract_plan(meeting_date: date, segments: List[Dict[str, Any]], model: str 
             if not title:
                 continue
             owner = t.get("owner")
+            if isinstance(owner, str) and "|" in owner:
+                owner = "; ".join([p.strip() for p in owner.split("|") if p.strip()])
+            
             due_ref = t.get("due_date_ref")
             due_iso, due_conf = _resolve_due_date(meeting_date, due_ref)
-            deps = t.get("dependencies") or []
+            if not _has_date_cue(due_ref):
+                due_iso, due_conf = None, 0.0
+            else:
+                try:
+                    if due_iso and date.fromisoformat(due_iso) < meeting_date:
+                        # do not accept past dates relative to meeting
+                        due_iso, due_conf = None, 0.0
+                except Exception:
+                    due_iso, due_conf = None, 0.0
+
+            deps = [d.strip() for d in (t.get("dependencies") or []) if isinstance(d, str) and d.strip()]
             phint = t.get("priority_hint")
             ev = t.get("evidence_text") or ""
+            if not ev or len(ev.strip()) < 6:
+                due_conf = min(due_conf, 0.3)
 
             merged_tasks.append({
                 "title": title,
@@ -186,6 +228,34 @@ def extract_plan(meeting_date: date, segments: List[Dict[str, Any]], model: str 
         for q in obj.get("open_questions", []):
             if isinstance(q, str) and q.strip():
                 merged_open.append(q.strip())
+
+    if len(merged_tasks) < 3:
+        full_tx = " ".join([s.get("text", "") for s in segments])
+        retry_prompt = _build_prompt(meeting_date, full_tx, speakers) + \
+            "\n\nReturn valid JSON only. Extract 3–6 concrete action items with verbs."
+        raw2 = _ollama_generate(retry_prompt, model=model, temperature=0.2, request_json=True)
+        obj2 = _parse_json_or_empty(raw2)
+
+        for t in obj2.get("tasks", []):
+            title = (t.get("title") or "").strip()
+            if not title:
+                continue
+            owner = t.get("owner")
+            due_ref = t.get("due_date_ref")
+            due_iso, due_conf = _resolve_due_date(meeting_date, due_ref)
+            deps = [d.strip() for d in (t.get("dependencies") or [])
+                    if isinstance(d, str) and d.strip()]
+            ev = t.get("evidence_text") or ""
+
+            merged_tasks.append({
+                "title": title,
+                "owner": owner,
+                "due_date": due_iso,
+                "priority": t.get("priority_hint"),
+                "dependencies": deps,
+                "evidence_text": ev,
+                "confidence": due_conf,
+            })
     
     # Collect names from whole transcript and fill missing owners if the evidence mentions them
     full_text = " ".join([s.get("text", "") for s in segments])
@@ -202,7 +272,10 @@ def extract_plan(meeting_date: date, segments: List[Dict[str, Any]], model: str 
     merged_tasks = [t for t in merged_tasks if _is_task_plausible(t, full_text)]
 
     # Merge summary and dedupe tasks by lowercase title
-    final_summary = " ".join(merged_summary)[:600] if merged_summary else ""
+    final_summary = " ".join(merged_summary).strip()
+    if final_summary and final_summary[-1] not in ".!?":
+        final_summary += "."
+    
     seen = set()
     deduped_tasks: List[Dict[str, Any]] = []
     for t in merged_tasks:
@@ -211,6 +284,10 @@ def extract_plan(meeting_date: date, segments: List[Dict[str, Any]], model: str 
             continue
         seen.add(key)
         deduped_tasks.append(t)
+    
+    titles_set = {x["title"] for x in deduped_tasks}
+    for x in deduped_tasks:
+        x["dependencies"] = [d for d in x.get("dependencies", []) if d in titles_set]
 
     # Minimal fallback so analyze never returns empty
     if not final_summary and not deduped_tasks:
@@ -372,3 +449,19 @@ def _resolve_due_date(meeting_date: date, due_ref: Optional[str]) -> Tuple[Optio
         pass
 
     return None, 0.3
+
+_DATE_CUE_RE = re.compile(
+    r"\b("
+    r"today|tomorrow|eod|cob|eow|eom|this|next|by|on|at|"
+    r"mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun|"
+    r"monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
+    r"jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec|"
+    r"\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}"
+    r")\b",
+    re.IGNORECASE
+)
+
+def _has_date_cue(s: Optional[str]) -> bool:
+    if not s:
+        return False
+    return bool(_DATE_CUE_RE.search(s))

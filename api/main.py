@@ -15,6 +15,9 @@ import uuid
 from starlette.responses import Response, StreamingResponse
 import io, csv, json
 
+import os
+USE_VAD = os.getenv("USE_VAD", "1") == "1"  # set to 0 to disable quickly
+VAD_AGGR = int(os.getenv("VAD_AGGR", "2"))
 
 app = FastAPI(
     title="CollabPlan-AI Core",
@@ -108,7 +111,13 @@ def transcribe_audio(req: TranscribeRequest):
     """
     # Run ASR
     asr = get_asr()
-    duration, segs_asr = asr.transcribe_file(req.path)
+    duration, segs_asr = asr.transcribe_file(
+        req.path,
+        use_ext_vad=USE_VAD,
+        vad_aggr=VAD_AGGR,
+        beam_size=5,
+        language=None,
+    )
 
     # Map ASR segments to API model
     segs_out = [
