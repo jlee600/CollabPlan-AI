@@ -88,6 +88,7 @@ def _build_prompt(meeting_date: date, chunk_text: str, speakers: List[str]) -> s
     Keep "priority_hint" realistic. Use High only if urgency words are present (urgent, asap, by EOD/EOW, blocker).
     If a due date is spoken, put it in due_date_ref exactly as heard.
     Output must be JSON only.
+    Include who decided what, any dates mentioned, and 2–4 concrete next steps in the summary.
     """.strip()
 
     return f"{rules}\n\n{schema}\n\nTranscript:\n\"\"\"\n{chunk_text}\n\"\"\""
