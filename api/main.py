@@ -2,8 +2,9 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from typing import List, Optional
 from datetime import date
+from sqlalchemy import func, desc
 
-from sqlmodel import Session, select
+from sqlmodel import Session, select, delete
 from store.db import init_db, Run, Segment, Plan, TaskRow, engine
 
 from core.asr import get_asr, ASRSegment
@@ -11,7 +12,9 @@ from core.extract import extract_plan, LLMError
 from core.diarize import diarize_file, assign_speakers_to_segments, build_speaker_name_map, apply_name_map
 
 import uuid
-import json
+from starlette.responses import Response, StreamingResponse
+import io, csv, json
+
 
 app = FastAPI(
     title="CollabPlan-AI Core",
@@ -192,8 +195,8 @@ def analyze_run(run_id: str):
     # Persist plan and tasks
     with Session(engine) as session:
         # Remove old plan/tasks for idempotency if you re-run analyze
-        session.exec(select(Plan).where(Plan.run_id == run_id))
-        session.exec(select(TaskRow).where(TaskRow.run_id == run_id))
+        session.exec(delete(TaskRow).where(TaskRow.run_id == run_id))
+        session.exec(delete(Plan).where(Plan.run_id == run_id))
 
         session.add(Plan(
             run_id=run_id,
@@ -203,12 +206,7 @@ def analyze_run(run_id: str):
 
         for t in plan["tasks"]:
             due_iso = t.get("due_date")  # "YYYY-MM-DD" or None
-            due_obj = None
-            if isinstance(due_iso, str) and due_iso:
-                try:
-                    due_obj = date.fromisoformat(due_iso)
-                except ValueError:
-                    due_obj = None  # ignore bad date strings
+            due_obj = date.fromisoformat(due_iso) if isinstance(due_iso, str) and due_iso else None
 
             session.add(TaskRow(
                 run_id=run_id,
@@ -271,3 +269,92 @@ def get_run(run_id: str):
         tasks=tasks,
         open_questions=open_q
     )
+
+@app.get("/runs")
+def list_runs():
+    with Session(engine) as session:
+        runs = session.exec(select(Run).order_by(desc(Run.created_at))).all()
+        items = []
+        for r in runs:
+            count_expr = func.count()  # pylint: disable=not-callable
+            task_count = session.exec(
+                select(count_expr).select_from(TaskRow).where(TaskRow.run_id == r.id)
+            ).one()
+
+            # small summary preview
+            plan = session.exec(select(Plan).where(Plan.run_id == r.id)).first()
+            preview = (plan.summary[:160] + "…") if plan and plan.summary and len(plan.summary) > 160 else (plan.summary if plan else "")
+            items.append({
+                "run_id": r.id,
+                "meeting_date": r.meeting_date,
+                "duration_sec": r.duration_sec,
+                "summary_preview": preview,
+                "task_count": int(task_count or 0),
+            })
+        return items
+
+@app.get("/export/{run_id}.csv")
+def export_csv(run_id: str):
+    with Session(engine) as session:
+        tasks = session.exec(select(TaskRow).where(TaskRow.run_id == run_id).order_by(TaskRow.id)).all()
+        if tasks is None:
+            raise HTTPException(status_code=404, detail=f"No tasks for run: {run_id}")
+
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(["title", "owner", "due_date", "priority", "dependencies", "confidence"])
+        for t in tasks:
+            deps = json.loads(t.dependencies_json or "[]")
+            writer.writerow([
+                t.title or "",
+                t.owner or "",
+                t.due_date.isoformat() if t.due_date else "",
+                t.priority or "",
+                "; ".join(deps),
+                ("" if t.confidence is None else f"{t.confidence:.2f}"),
+            ])
+        buf.seek(0)
+        headers = {
+            "Content-Disposition": f'attachment; filename="{run_id}.csv"'
+        }
+        return StreamingResponse(iter([buf.getvalue()]), media_type="text/csv", headers=headers)
+
+@app.get("/export/{run_id}.md")
+def export_markdown(run_id: str):
+    with Session(engine) as session:
+        run = session.exec(select(Run).where(Run.id == run_id)).first()
+        if not run:
+            raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
+
+        plan = session.exec(select(Plan).where(Plan.run_id == run_id)).first()
+        tasks = session.exec(select(TaskRow).where(TaskRow.run_id == run_id).order_by(TaskRow.id)).all()
+
+        summary = plan.summary if plan else ""
+        open_qs = json.loads(plan.open_questions_json or "[]") if plan else []
+
+        lines = []
+        lines.append(f"# Meeting Plan – {run_id}")
+        lines.append(f"*Date:* {run.meeting_date.isoformat()}")
+        lines.append("")
+        lines.append("## Summary")
+        lines.append(summary or "_(none)_")
+        lines.append("")
+        lines.append("## Tasks")
+        if tasks:
+            for t in tasks:
+                deps = json.loads(t.dependencies_json or "[]")
+                due = t.due_date.isoformat() if t.due_date else "—"
+                conf = f"{t.confidence:.2f}" if t.confidence is not None else "—"
+                lines.append(f"- **{t.title}** — owner: {t.owner or '—'}; due: {due}; priority: {t.priority or '—'}; deps: {', '.join(deps) or '—'}; conf: {conf}")
+        else:
+            lines.append("_(no tasks)_")
+        lines.append("")
+        lines.append("## Open Questions")
+        if open_qs:
+            for q in open_qs:
+                lines.append(f"- {q}")
+        else:
+            lines.append("_(none)_")
+
+        md = "\n".join(lines)
+        return Response(content=md, media_type="text/markdown")

@@ -1,6 +1,7 @@
 from sqlmodel import SQLModel, Field, create_engine
+from sqlalchemy import Column, DateTime
 from typing import Optional
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 
 # SQLite 
 DATABASE_URL = "sqlite:///./collabplan.db"
@@ -11,7 +12,9 @@ class Run(SQLModel, table=True):
     meeting_date: date
     source: str  # "upload", "recording", etc.
     duration_sec: Optional[float] = None
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(
+    sa_column=Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+)
 
 class Segment(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
