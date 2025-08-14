@@ -87,8 +87,10 @@ def _build_prompt(meeting_date: date, chunk_text: str, speakers: List[str]) -> s
     Always fill "evidence_text" with a short quote backing the task.
     Keep "priority_hint" realistic. Use High only if urgency words are present (urgent, asap, by EOD/EOW, blocker).
     If a due date is spoken, put it in due_date_ref exactly as heard.
-    Output must be JSON only.
+    If information (owner, due date, dependencies) isn’t clearly stated, leave it null/empty.
+    Do not invent details or entities not in the transcript.
     Include who decided what, any dates mentioned, and 2–4 concrete next steps in the summary.
+    Output must be JSON only.
     """.strip()
 
     return f"{rules}\n\n{schema}\n\nTranscript:\n\"\"\"\n{chunk_text}\n\"\"\""
@@ -121,6 +123,28 @@ def chunk_segments_to_text(segments: List[Dict[str, Any]], max_chars: int = 3000
         chunks.append(" ".join(cur))
     return chunks
 
+_FILLER_TITLES = {
+    "follow up", "follow-up", "sync up", "circle back",
+    "review", "discuss", "research", "investigate"
+}
+
+def _is_task_plausible(t: dict, transcript_text: str) -> bool:
+    title = (t.get("title") or "").strip()
+    if len(title) < 4:
+        return False
+    
+    # reject titles that are only a single filler verb/noun
+    simple = re.sub(r"[^a-zA-Z ]+", "", title).lower().strip()
+    if simple in _FILLER_TITLES:
+        return False
+    
+    # require that at least one content word from the title appears in transcript
+    words = [w for w in re.findall(r"[a-zA-Z]{3,}", simple) if w not in _FILLER_TITLES]
+    if words:
+        hits = sum(1 for w in words if w.lower() in transcript_text.lower())
+        if hits == 0:
+            return False
+    return True
 
 def extract_plan(meeting_date: date, segments: List[Dict[str, Any]], model: str = DEFAULT_MODEL) -> Dict[str, Any]:
     texts = chunk_segments_to_text(segments)
@@ -175,6 +199,7 @@ def extract_plan(meeting_date: date, segments: List[Dict[str, Any]], model: str 
         if nm:
             t["owner"] = nm
             t["confidence"] = max(t.get("confidence", 0.0), 0.6)
+    merged_tasks = [t for t in merged_tasks if _is_task_plausible(t, full_text)]
 
     # Merge summary and dedupe tasks by lowercase title
     final_summary = " ".join(merged_summary)[:600] if merged_summary else ""

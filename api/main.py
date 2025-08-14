@@ -98,21 +98,6 @@ class RunBundle(BaseModel):
 def health():
     return {"status": "ok", "version": app.version}
 
-@app.post("/analyze", response_model=AnalyzeResponse)
-def analyze(req: AnalyzeRequest):    
-    run_id = f"run_{uuid.uuid4().hex[:12]}"
-    summary = "Placeholder summary. Pipeline not implemented yet."
-    tasks: List[Task] = []
-    open_questions: List[str] = []
-
-    return AnalyzeResponse(
-        run_id=run_id,
-        meeting_date=req.meeting_date,
-        summary=summary,
-        tasks=tasks,
-        open_questions=open_questions,
-    )
-
 @app.post("/transcribe", response_model=TranscribeResponse)
 def transcribe_audio(req: TranscribeRequest):
     """
@@ -162,6 +147,96 @@ def transcribe_audio(req: TranscribeRequest):
         session.commit()
 
     return TranscribeResponse(run_id=run_id, duration_sec=duration, segments=segs_out)
+
+@app.post("/analyze", response_model=AnalyzeResponse)
+def analyze_text(req: AnalyzeRequest):
+    run_id = f"run_{uuid.uuid4().hex[:12]}"
+
+    text = (req.transcript or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Empty transcript")
+
+    import re as _re
+    sentences = [s.strip() for s in _re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+
+    segs = []
+    for i, s in enumerate(sentences):
+        segs.append({"idx": i, "start": 0.0, "end": 0.0, "text": s, "speaker": None})
+
+    # persist run + segments (duration unknown here)
+    with Session(engine) as session:
+        session.add(Run(id=run_id, meeting_date=req.meeting_date, source="text", duration_sec=None))
+        for seg in segs:
+            session.add(Segment(
+                run_id=run_id,
+                idx=seg["idx"],
+                start=seg["start"],
+                end=seg["end"],
+                text=seg["text"],
+                speaker=seg["speaker"],
+            ))
+        session.commit()
+
+    # plan
+    try:
+        plan = extract_plan(req.meeting_date, segs)
+    except LLMError as e:
+        raise HTTPException(status_code=502, detail=f"LLM failure: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Analyze failed: {e}")
+
+    with Session(engine) as session:
+        # idempotency not needed (new run), just write
+        session.add(Plan(
+            run_id=run_id,
+            summary=plan["summary"],
+            open_questions_json=json.dumps(plan["open_questions"])
+        ))
+
+        for t in plan["tasks"]:
+            # convert due_date "YYYY-MM-DD" -> date
+            due_obj = None
+            due_iso = t.get("due_date")
+            if isinstance(due_iso, str) and due_iso:
+                try:
+                    due_obj = date.fromisoformat(due_iso)
+                except ValueError:
+                    due_obj = None
+
+            session.add(TaskRow(
+                run_id=run_id,
+                title=t["title"],
+                owner=t.get("owner"),
+                due_date=due_obj,
+                priority=t.get("priority"),
+                dependencies_json=json.dumps(t.get("dependencies", [])),
+                evidence_idx=None,
+                evidence_span_json=None,
+                confidence=t.get("confidence"),
+            ))
+        session.commit()
+
+    # 6) response DTOs
+    tasks_out = [
+        Task(
+            title=t["title"],
+            owner=t.get("owner"),
+            due_date=(date.fromisoformat(t["due_date"]) if isinstance(t.get("due_date"), str) else None),
+            priority=t.get("priority"),
+            dependencies=t.get("dependencies", []),
+            evidence=Evidence(segment_idx=None, span=None),
+            confidence=t.get("confidence"),
+        )
+        for t in plan["tasks"]
+    ]
+
+    return AnalyzeResponse(
+        run_id=run_id,
+        meeting_date=req.meeting_date,
+        summary=plan["summary"],
+        tasks=tasks_out,
+        open_questions=plan["open_questions"],
+    )
 
 @app.post("/analyze/{run_id}", response_model=AnalyzePlanResponse)
 def analyze_run(run_id: str):
