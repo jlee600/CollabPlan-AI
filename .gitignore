@@ -45,4 +45,8 @@ Thumbs.db
 # Byte-compiled/misc
 *.so
 
-
+# UI
+collabplan-ui/node_modules/
+collabplan-ui/dist/
+collabplan-ui/.vite/
+collabplan-ui/.DS_Store
