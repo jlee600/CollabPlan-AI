@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel, Field
 from typing import List, Optional
 from datetime import date
@@ -10,10 +10,10 @@ from store.db import init_db, Run, Segment, Plan, TaskRow, engine
 from core.asr import get_asr, ASRSegment
 from core.extract import extract_plan, LLMError
 from core.diarize import diarize_file, assign_speakers_to_segments, build_speaker_name_map, apply_name_map
-
-import uuid
 from starlette.responses import Response, StreamingResponse
 import io, csv, json
+import hashlib, mimetypes, pathlib, shutil, uuid
+
 
 import os
 USE_VAD = os.getenv("USE_VAD", "1") == "1"  # set to 0 to disable quickly
@@ -26,6 +26,21 @@ app = FastAPI(
 )
 
 init_db()
+
+UPLOAD_DIR = pathlib.Path("data/uploads")
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+_AUDIO_CT = {
+    "audio/mpeg", "audio/wav", "audio/x-wav", "audio/mp4", "audio/x-m4a",
+    "audio/webm", "video/webm", "audio/ogg", "video/mp4",
+    "audio/x-flac", "audio/flac"
+}
+
+def _safe_ext(filename: str, content_type: str) -> str:
+    ext = pathlib.Path(filename).suffix.lower()
+    if not ext:
+        ext = mimetypes.guess_extension(content_type or "") or ".bin"
+    return ext
 
 # ---------- analyze ----------
 
@@ -442,3 +457,47 @@ def export_markdown(run_id: str):
 
         md = "\n".join(lines)
         return Response(content=md, media_type="text/markdown")
+    
+@app.post("/upload/audio")
+def upload_audio(file: UploadFile = File(...)):
+    ct = (file.content_type or "").lower()
+    if ct not in _AUDIO_CT:
+        # still allow, faster-whisper + ffmpeg can read many formats
+        print(f"[upload_audio] unexpected content-type: {ct}")
+
+    ext = _safe_ext(file.filename or "audio", ct)
+    safe_name = f"{uuid.uuid4().hex}{ext}"
+    out_path = UPLOAD_DIR / safe_name
+
+    sha = hashlib.sha256()
+    with out_path.open("wb") as f:
+        while True:
+            chunk = file.file.read(1024 * 1024)
+            if not chunk:
+                break
+            sha.update(chunk)
+            f.write(chunk)
+
+    return {
+        "path": str(out_path),
+        "sha256": sha.hexdigest(),
+        "filename": file.filename,
+        "content_type": ct,
+        "bytes": out_path.stat().st_size,
+    }
+
+@app.post("/analyze_file", response_model=AnalyzeResponse)
+def analyze_file(meeting_date: date = Form(...), file: UploadFile = File(...)):
+    raw = file.file.read()
+
+    def _text_bytes_to_str(b: bytes) -> str:
+        for enc in ("utf-8", "utf-16", "latin-1"):
+            try:
+                return b.decode(enc)
+            except Exception:
+                continue
+        return b.decode("utf-8", errors="ignore")
+
+    text = _text_bytes_to_str(raw)
+    req = AnalyzeRequest(meeting_date=meeting_date, transcript=text)
+    return analyze_text(req)
