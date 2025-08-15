@@ -3,19 +3,17 @@ from pydantic import BaseModel, Field
 from typing import List, Optional
 from datetime import date
 from sqlalchemy import func, desc
-
 from sqlmodel import Session, select, delete
 from store.db import init_db, Run, Segment, Plan, TaskRow, engine
-
 from core.asr import get_asr, ASRSegment
 from core.extract import extract_plan, LLMError
 from core.diarize import diarize_file, assign_speakers_to_segments, build_speaker_name_map, apply_name_map
 from starlette.responses import Response, StreamingResponse
 import io, csv, json
-import hashlib, mimetypes, pathlib, shutil, uuid
-
-
+import hashlib, mimetypes, pathlib, shutil, uuid, tempfile
+from fastapi.middleware.cors import CORSMiddleware
 import os
+
 USE_VAD = os.getenv("USE_VAD", "1") == "1"  # set to 0 to disable quickly
 VAD_AGGR = int(os.getenv("VAD_AGGR", "2"))
 
@@ -23,6 +21,12 @@ app = FastAPI(
     title="CollabPlan-AI Core",
     version="0.1.0",
     description="Backend core for meeting transcription and action planning",
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 init_db()
@@ -171,6 +175,75 @@ def transcribe_audio(req: TranscribeRequest):
         session.commit()
 
     return TranscribeResponse(run_id=run_id, duration_sec=duration, segments=segs_out)
+
+@app.post("/transcribe_upload", response_model=TranscribeResponse)
+async def transcribe_upload(
+    meeting_date: date = Form(...),
+    diarize: bool = Form(False),
+    file: UploadFile = File(...),
+):
+    """
+    Accept an uploaded audio file, run ASR (and optional diarization), save to DB, return run info.
+    """
+    # persist upload to a temp file
+    suffix = "." + (file.filename.split(".")[-1].lower() if file.filename and "." in file.filename else "bin")
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp_path = tmp.name
+        shutil.copyfileobj(file.file, tmp)
+
+    try:
+        # ASR
+        asr = get_asr()
+        duration, segs_asr = asr.transcribe_file(
+            tmp_path,
+            use_ext_vad=USE_VAD,
+            vad_aggr=VAD_AGGR,
+            beam_size=5,
+            language=None,
+        )
+
+        segs_out = [
+            SegmentOut(idx=s.idx, start=s.start, end=s.end, text=s.text, speaker=s.speaker)
+            for s in segs_asr
+        ]
+
+        # diarization if requested
+        if diarize:
+            try:
+                turns = diarize_file(tmp_path)
+                segs_dicts = [dict(idx=s.idx, start=s.start, end=s.end, text=s.text, speaker=s.speaker) for s in segs_out]
+                segs_with_spk = assign_speakers_to_segments(segs_dicts, turns)
+
+                name_map = build_speaker_name_map(segs_with_spk)
+                if name_map:
+                    segs_with_spk = apply_name_map(segs_with_spk, name_map)
+
+                segs_out = [SegmentOut(**s) for s in segs_with_spk]
+            except Exception as e:
+                print(f"[diarize_upload] failed: {e}")
+
+        # persist
+        run_id = f"run_{uuid.uuid4().hex[:12]}"
+        with Session(engine) as session:
+            session.add(Run(id=run_id, meeting_date=meeting_date, source="upload", duration_sec=duration))
+            for s in segs_out:
+                session.add(Segment(
+                    run_id=run_id,
+                    idx=s.idx,
+                    start=s.start,
+                    end=s.end,
+                    text=s.text,
+                    speaker=s.speaker
+                ))
+            session.commit()
+
+        return TranscribeResponse(run_id=run_id, duration_sec=duration, segments=segs_out)
+
+    finally:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
 
 @app.post("/analyze", response_model=AnalyzeResponse)
 def analyze_text(req: AnalyzeRequest):
@@ -329,6 +402,22 @@ def analyze_run(run_id: str):
         open_questions=plan["open_questions"],
     )
 
+@app.post("/analyze_file", response_model=AnalyzeResponse)
+def analyze_file(meeting_date: date = Form(...), file: UploadFile = File(...)):
+    raw = file.file.read()
+
+    def _text_bytes_to_str(b: bytes) -> str:
+        for enc in ("utf-8", "utf-16", "latin-1"):
+            try:
+                return b.decode(enc)
+            except Exception:
+                continue
+        return b.decode("utf-8", errors="ignore")
+
+    text = _text_bytes_to_str(raw)
+    req = AnalyzeRequest(meeting_date=meeting_date, transcript=text)
+    return analyze_text(req)
+
 @app.get("/run/{run_id}", response_model=RunBundle)
 def get_run(run_id: str):
     with Session(engine) as session:
@@ -485,19 +574,3 @@ def upload_audio(file: UploadFile = File(...)):
         "content_type": ct,
         "bytes": out_path.stat().st_size,
     }
-
-@app.post("/analyze_file", response_model=AnalyzeResponse)
-def analyze_file(meeting_date: date = Form(...), file: UploadFile = File(...)):
-    raw = file.file.read()
-
-    def _text_bytes_to_str(b: bytes) -> str:
-        for enc in ("utf-8", "utf-16", "latin-1"):
-            try:
-                return b.decode(enc)
-            except Exception:
-                continue
-        return b.decode("utf-8", errors="ignore")
-
-    text = _text_bytes_to_str(raw)
-    req = AnalyzeRequest(meeting_date=meeting_date, transcript=text)
-    return analyze_text(req)
