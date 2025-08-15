@@ -10,9 +10,8 @@ from core.extract import extract_plan, LLMError
 from core.diarize import diarize_file, assign_speakers_to_segments, build_speaker_name_map, apply_name_map
 from starlette.responses import Response, StreamingResponse
 import io, csv, json
-import hashlib, mimetypes, pathlib, shutil, uuid, tempfile
+import hashlib, mimetypes, pathlib, shutil, uuid, tempfile ,subprocess, os 
 from fastapi.middleware.cors import CORSMiddleware
-import os
 
 USE_VAD = os.getenv("USE_VAD", "1") == "1"  # set to 0 to disable quickly
 VAD_AGGR = int(os.getenv("VAD_AGGR", "2"))
@@ -128,10 +127,11 @@ def transcribe_audio(req: TranscribeRequest):
     - Saves segments to DB
     - Returns run_id, duration, segments
     """
+    norm_path = _normalize_to_wav16k(req.path)
     # Run ASR
     asr = get_asr()
     duration, segs_asr = asr.transcribe_file(
-        req.path,
+        norm_path,
         use_ext_vad=USE_VAD,
         vad_aggr=VAD_AGGR,
         beam_size=5,
@@ -146,7 +146,7 @@ def transcribe_audio(req: TranscribeRequest):
     
     if req.diarize:
         try:
-            turns = diarize_file(req.path)
+            turns = diarize_file(norm_path)
             segs_dicts = [dict(idx=s.idx, start=s.start, end=s.end, text=s.text, speaker=s.speaker) for s in segs_out]
             segs_with_spk = assign_speakers_to_segments(segs_dicts, turns)
 
@@ -190,12 +190,13 @@ async def transcribe_upload(
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp_path = tmp.name
         shutil.copyfileobj(file.file, tmp)
-
+    
+    norm_path = _normalize_to_wav16k(tmp_path)
     try:
         # ASR
         asr = get_asr()
         duration, segs_asr = asr.transcribe_file(
-            tmp_path,
+            norm_path,
             use_ext_vad=USE_VAD,
             vad_aggr=VAD_AGGR,
             beam_size=5,
@@ -210,7 +211,7 @@ async def transcribe_upload(
         # diarization if requested
         if diarize:
             try:
-                turns = diarize_file(tmp_path)
+                turns = diarize_file(norm_path)
                 segs_dicts = [dict(idx=s.idx, start=s.start, end=s.end, text=s.text, speaker=s.speaker) for s in segs_out]
                 segs_with_spk = assign_speakers_to_segments(segs_dicts, turns)
 
@@ -566,6 +567,17 @@ def upload_audio(file: UploadFile = File(...)):
                 break
             sha.update(chunk)
             f.write(chunk)
+    
+    wav_name = f"{out_path.stem}.wav"
+    wav_path = UPLOAD_DIR / wav_name
+    try:
+        tmp_wav = _normalize_to_wav16k(str(out_path))
+        # if tmp_wav != wav_path, move/replace
+        if tmp_wav != str(wav_path):
+            shutil.move(tmp_wav, wav_path)
+    except Exception as e:
+        print(f"[upload_audio] normalize failed: {e}")
+        wav_path = out_path
 
     return {
         "path": str(out_path),
@@ -574,3 +586,31 @@ def upload_audio(file: UploadFile = File(...)):
         "content_type": ct,
         "bytes": out_path.stat().st_size,
     }
+
+def _normalize_to_wav16k(src_path: str) -> str:
+    """
+    Convert any input audio to 16kHz mono WAV for consistent ASR + diarization.
+    Returns a temp file path you should delete when done.
+    """
+    dst = tempfile.NamedTemporaryFile(delete=False, suffix=".wav").name
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", src_path,
+                "-ac", "1", "-ar", "16000",   # mono, 16k
+                "-f", "wav", dst
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+        )
+        return dst
+    except Exception as e:
+        # if ffmpeg not present or conversion failed, fall back to original
+        try:
+            os.unlink(dst)
+        except Exception:
+            pass
+        print(f"[normalize] ffmpeg convert failed: {e} (using original)")
+        return src_path
+    
