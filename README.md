@@ -4,11 +4,23 @@ Lightweight, local-first **meeting & conversation intelligence**: transcribe aud
 ![homepage](docs/screenshots/main.png)
 > **Use it for more than meetings.** CollabPlan-AI works with any conversation: support calls, daily stand-ups, ad-hoc voice notes — even a 15-second personal reminder.
 
+## Table of Contents
+- [Overview](#overview)
+- [File tree](#file-tree)
+- [Features](#features)
+- [Tech Stack](#tech-stack)
+- [UI](#ui)
+- [Quick Start](#quick-start)
+- [Using the App](#using-the-app)
+- [OpenAPI / Swagger](#openapi--swagger)
+- [Configuration](#configuration)
+- [Demo Video](#demo-video)
+
 ## Overview
 
 CollabPlan-AI consists of a FastAPI backend and a React (Vite + Tailwind) frontend.
 
-![diagram](docs/screenshots/CollabPlan.pdf)
+![diagram](docs/screenshots/CollabPlan.png)
 
 **High-level workflow**
 
@@ -27,6 +39,24 @@ CollabPlan-AI consists of a FastAPI backend and a React (Vite + Tailwind) fronte
    - View transcript segments, summary, tasks, and open questions in the UI.
    - Export results to **CSV** or **Markdown**.
 
+## File tree
+```plaintext
+CollabPlan-AI/
+├─ api/
+│  └─ main.py                — FastAPI
+│
+├─ core/
+│  ├─ asr.py                 — transcription
+│  ├─ diarize.py             — diarization
+│  ├─ extract.py             — extraction using local LLM
+│  ├─ vad.py                 — VAD helpers / ASR pipeline
+│  ├─ post.py                — Misc post-processing 
+│
+├─ store/
+│  ├─ db.py                  — SQLite
+│
+├─ collabplan-ui/            — React + Vite + Tailwind frontend
+```
 
 ## Features
 
@@ -157,5 +187,4 @@ Browse and test endpoints live at [http://localhost:8000/docs](http://localhost:
 - **LLM model**: controlled by your **Ollama** setup (e.g., `llama3.1:8b`); selection is implemented in `core/extract`.  
 
 ## Demo Video 
-<iframe width="560" height="315" src="https://youtu.be/iZvC5hSalXE" 
-frameborder="0" allowfullscreen></iframe>
+[![Demo on YouTube](https://img.shields.io/badge/Watch-Demo-red?logo=youtube)](https://youtu.be/iZvC5hSalXE)
