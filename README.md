@@ -1,8 +1,8 @@
 # CollabPlan-AI
-Lightweight, local-first **meeting & conversation intelligence**: transcribe audio, extract actionable tasks, and export outcomes — all from a simple web UI.
+Lightweight, local-first **meeting & conversation intelligence**: transcribe audio, extract actionable tasks, and export outcomes - all from a simple web UI.
 
 ![homepage](docs/screenshots/main.png)
-> **Use it for more than meetings.** CollabPlan-AI works with any conversation: support calls, daily stand-ups, ad-hoc voice notes — even a 15-second personal reminder.
+> **Use it for more than meetings.** CollabPlan-AI works with any conversation: support calls, daily stand-ups, ad-hoc voice notes - even a 15-second personal reminder.
 
 ## Table of Contents
 - [Overview](#overview)
@@ -163,7 +163,7 @@ npm run dev
 - Click **Analyze** to (re)run the LLM planning on the current run.
 
 ### C) Analyze Text
-- Paste raw text and click **Analyze text** — the backend will create a run from text only.
+- Paste raw text and click **Analyze text** - the backend will create a run from text only.
 
 ### D) Runs
 - Browse previously created runs, open a run, and export to **CSV/MD**.
